@@ -1,0 +1,8 @@
+{
+  "compression_keep_counts_match_expected": true,
+  "compression_keep_counts_monotonic": true,
+  "eval_length": 64,
+  "num_samples": 32,
+  "seq_len_cap": 2048,
+  "unique_keep_count_levels": 10
+}

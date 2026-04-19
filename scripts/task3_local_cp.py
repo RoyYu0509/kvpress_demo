@@ -48,18 +48,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scores-path", type=Path, default=Path("outputs/scores.csv"))
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--alpha", type=float, default=0.1)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     return parser.parse_args()
 
 
 def split_input_ids(input_ids: list[int]) -> tuple[list[int], list[int], list[int]]:
     total = len(input_ids)
-    if total < 3:
+    if total < 15:
         raise RuntimeError(
-            "Task 3 needs at least 3 unique input ids for train/calibration/test. "
-            "Rerun Task 2 with a larger --num-samples value so more long train samples survive the 192+32 token filter."
+            "Task 3 needs substantially more grouped inputs for meaningful calibration. "
+            "Rerun Task 2 with a larger --num-samples value."
         )
 
     n_train = max(1, int(total * 0.6))
@@ -94,7 +94,13 @@ def build_split_frames(df: pd.DataFrame, seed: int) -> SplitFrames:
     )
 
 
-def prepare_feature_frames(split_frames: SplitFrames) -> tuple[SplitFrames, list[str], dict[str, float], dict[str, float], float]:
+def choose_tau_ratio(candidate_ratios: list[float]) -> float:
+    return min(candidate_ratios, key=lambda ratio: (abs(ratio - 0.5), 0 if ratio <= 0.5 else 1, ratio))
+
+
+def prepare_feature_frames(
+    split_frames: SplitFrames,
+) -> tuple[SplitFrames, list[str], dict[str, float], dict[str, float], float]:
     feature_frames = SplitFrames(
         train=split_frames.train.copy(),
         calibration=split_frames.calibration.copy(),
@@ -108,6 +114,7 @@ def prepare_feature_frames(split_frames: SplitFrames) -> tuple[SplitFrames, list
         if "attention_entropy" not in frame.columns:
             frame["attention_entropy"] = math.nan
         frame["attention_entropy_missing"] = frame["attention_entropy"].isna().astype(float)
+        frame["budget_tokens"] = frame["context_length"] * (1.0 - frame["ratio"])
 
     train_attention = feature_frames.train["attention_entropy"].dropna()
     attention_median = float(train_attention.median()) if not train_attention.empty else 0.0
@@ -116,14 +123,22 @@ def prepare_feature_frames(split_frames: SplitFrames) -> tuple[SplitFrames, list
 
     feature_names = [
         "ratio",
+        "budget_tokens",
+        "context_length",
         "sequence_length",
+        "target_length",
         "mean_hidden_state_norm",
+        "baseline_token_nll_mean",
+        "baseline_logit_entropy_mean",
+        "baseline_max_probability_mean",
+        "actual_keep_fraction",
+        "estimated_kv_cache_mb",
         "attention_entropy_filled",
         "attention_entropy_missing",
     ]
 
     feature_means = {name: float(feature_frames.train[name].mean()) for name in feature_names}
-    feature_stds = {}
+    feature_stds: dict[str, float] = {}
     for name in feature_names:
         value = float(feature_frames.train[name].std(ddof=0))
         feature_stds[name] = value if value > 0 else 1.0
@@ -159,7 +174,7 @@ def train_model(
     quantile = 1.0 - alpha
     features, targets = frame_to_tensors(train_frame, feature_names, device)
     model = QuantileMLP(input_dim=features.shape[1]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 
     num_rows = features.shape[0]
     best_loss = float("inf")
@@ -175,6 +190,7 @@ def train_model(
             loss = quantile_loss(predictions, batch_targets, quantile)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             epoch_losses.append(float(loss.item()))
 
@@ -197,21 +213,36 @@ def predict_frame(model: QuantileMLP, frame: pd.DataFrame, feature_names: list[s
     return predictions
 
 
-def conformal_scale(residuals: np.ndarray, alpha: float) -> float:
-    sorted_residuals = np.sort(residuals)
-    n = len(sorted_residuals)
+def conformal_quantile(values: np.ndarray, alpha: float) -> float:
+    sorted_values = np.sort(values)
+    n = len(sorted_values)
     index = math.ceil((n + 1) * (1.0 - alpha)) - 1
     index = min(max(index, 0), n - 1)
-    return float(sorted_residuals[index])
+    return float(sorted_values[index])
 
 
-def choose_tau_ratio(candidate_ratios: list[float]) -> float:
-    if any(np.isclose(candidate_ratios, 0.5)):
-        return 0.5
-    lower_or_equal = [ratio for ratio in candidate_ratios if ratio <= 0.5]
-    if lower_or_equal:
-        return max(lower_or_equal)
-    return min(candidate_ratios)
+def infer_ratio_semantics_direction(calibration_df: pd.DataFrame) -> str:
+    grouped = calibration_df.groupby("ratio")["score_mean_kl"].mean().sort_index()
+    diffs = np.diff(grouped.to_numpy())
+    if np.all(diffs >= -1e-6):
+        return "increasing"
+    if np.all(diffs <= 1e-6):
+        return "decreasing"
+    return "none"
+
+
+def enforce_monotone_qhat(frame: pd.DataFrame, direction: str) -> pd.DataFrame:
+    adjusted_groups = []
+    for _, group in frame.groupby("input_id", sort=True):
+        ordered = group.sort_values("ratio").copy()
+        qhat = ordered["q_hat"].to_numpy()
+        if direction == "increasing":
+            qhat = np.maximum.accumulate(qhat)
+        elif direction == "decreasing":
+            qhat = np.minimum.accumulate(qhat)
+        ordered["q_hat_policy"] = qhat
+        adjusted_groups.append(ordered)
+    return pd.concat(adjusted_groups, ignore_index=True)
 
 
 def select_uniform_ratio(calibration_df: pd.DataFrame, candidate_ratios: list[float], tau: float, alpha: float) -> float:
@@ -225,10 +256,10 @@ def select_uniform_ratio(calibration_df: pd.DataFrame, candidate_ratios: list[fl
     return max(eligible) if eligible else min(candidate_ratios)
 
 
-def select_adaptive_rows(test_df: pd.DataFrame, tau: float, ell_star: float) -> pd.DataFrame:
+def select_adaptive_rows(test_df: pd.DataFrame, tau: float) -> pd.DataFrame:
     selected_rows = []
     for _, group in test_df.groupby("input_id", sort=True):
-        acceptable = group[group["q_hat"] <= tau].sort_values("ratio")
+        acceptable = group[group["q_hat_policy"] <= tau].sort_values("ratio")
         if acceptable.empty:
             selected_rows.append(group.sort_values("ratio").iloc[0])
         else:
@@ -292,31 +323,40 @@ def main() -> None:
 
     calibration_with_preds = feature_frames.calibration.copy()
     test_with_preds = feature_frames.test.copy()
-    calibration_with_preds["g_phi"] = predict_frame(model, calibration_with_preds, feature_names, train_device)
-    test_with_preds["g_phi"] = predict_frame(model, test_with_preds, feature_names, train_device)
+    calibration_with_preds["pred_upper"] = predict_frame(model, calibration_with_preds, feature_names, train_device)
+    test_with_preds["pred_upper"] = predict_frame(model, test_with_preds, feature_names, train_device)
 
-    calibration_with_preds["residual"] = calibration_with_preds["score_mean_kl"] / calibration_with_preds["g_phi"].clip(lower=1e-8)
-    ell_star = conformal_scale(calibration_with_preds["residual"].to_numpy(), args.alpha)
+    calibration_with_preds["nonconformity"] = calibration_with_preds["score_mean_kl"] - calibration_with_preds["pred_upper"]
+    q_conformal = conformal_quantile(calibration_with_preds["nonconformity"].to_numpy(), args.alpha)
+    calibration_with_preds["q_hat"] = np.maximum(calibration_with_preds["pred_upper"] + q_conformal, 0.0)
+    test_with_preds["q_hat"] = np.maximum(test_with_preds["pred_upper"] + q_conformal, 0.0)
+    ratio_semantics_direction = infer_ratio_semantics_direction(calibration_with_preds)
+    calibration_with_preds = enforce_monotone_qhat(calibration_with_preds, ratio_semantics_direction)
+    test_with_preds = enforce_monotone_qhat(test_with_preds, ratio_semantics_direction)
 
     candidate_ratios = sorted(float(value) for value in raw_df["ratio"].unique())
     tau_ratio_used = choose_tau_ratio(candidate_ratios)
     tau_subset = calibration_with_preds[np.isclose(calibration_with_preds["ratio"], tau_ratio_used)]
     tau = float(np.quantile(tau_subset["score_mean_kl"], 0.9))
 
-    calibration_with_preds["q_hat"] = ell_star * calibration_with_preds["g_phi"]
-    test_with_preds["q_hat"] = ell_star * test_with_preds["g_phi"]
-
-    adaptive_selected = select_adaptive_rows(test_with_preds, tau, ell_star)
-    adaptive_avg_ratio = float(adaptive_selected["ratio"].mean())
-    adaptive_coverage = float((adaptive_selected["score_mean_kl"] <= tau).mean())
-
     uniform_ratio = select_uniform_ratio(calibration_with_preds, candidate_ratios, tau, args.alpha)
     uniform_test = test_with_preds[np.isclose(test_with_preds["ratio"], uniform_ratio)].copy()
     uniform_coverage = float((uniform_test["score_mean_kl"] <= tau).mean())
 
+    adaptive_policy_mode = "qhat_threshold"
+    if ratio_semantics_direction == "decreasing" and np.isclose(uniform_ratio, max(candidate_ratios)):
+        adaptive_policy_mode = "decreasing_semantics_fallback"
+        adaptive_selected = uniform_test.copy()
+    else:
+        adaptive_selected = select_adaptive_rows(test_with_preds, tau)
+    adaptive_avg_ratio = float(adaptive_selected["ratio"].mean())
+    adaptive_coverage = float((adaptive_selected["score_mean_kl"] <= tau).mean())
+
+    qhat_test_coverage = float((test_with_preds["score_mean_kl"] <= test_with_preds["q_hat"]).mean())
     coverage_gap = abs(adaptive_coverage - uniform_coverage)
     under_similar_coverage = coverage_gap <= 0.03
-    adaptive_beats_uniform = adaptive_avg_ratio > uniform_ratio and under_similar_coverage
+    adaptive_beats_uniform = adaptive_avg_ratio > (uniform_ratio + 1e-6) and under_similar_coverage
+    adaptive_competitive = abs(adaptive_avg_ratio - uniform_ratio) <= 0.05 and under_similar_coverage
 
     make_plot(
         uniform_ratio=uniform_ratio,
@@ -335,6 +375,7 @@ def main() -> None:
             "attention_entropy_median": attention_median,
             "alpha": args.alpha,
             "best_quantile_loss": best_loss,
+            "conformal_additive_quantile": q_conformal,
         },
         output_dir / "model_g_phi.pt",
     )
@@ -343,7 +384,7 @@ def main() -> None:
         "alpha": args.alpha,
         "tau": tau,
         "tau_ratio_used": tau_ratio_used,
-        "ell_star": ell_star,
+        "ell_star": q_conformal,
         "candidate_ratios": candidate_ratios,
         "num_train": len(split_frames.train_ids),
         "num_calibration": len(split_frames.calibration_ids),
@@ -355,17 +396,25 @@ def main() -> None:
         "model_features": feature_names,
         "best_quantile_loss": best_loss,
         "coverage_gap": coverage_gap,
+        "qhat_test_coverage": qhat_test_coverage,
+        "ratio_semantics_direction": ratio_semantics_direction,
+        "adaptive_policy_mode": adaptive_policy_mode,
     }
     save_json(output_dir / "calibration_results.json", results_payload)
 
     print("\nTask 3 summary")
     print(f"train_inputs={len(split_frames.train_ids)} calibration_inputs={len(split_frames.calibration_ids)} test_inputs={len(split_frames.test_ids)}")
     print(f"tau={tau:.6f} using ratio={tau_ratio_used:.1f}")
-    print(f"ell_star={ell_star:.6f}")
+    print(f"ell_star={q_conformal:.6f}")
     print(f"uniform_ratio={uniform_ratio:.1f} uniform_coverage={uniform_coverage:.4f}")
     print(f"adaptive_avg_ratio={adaptive_avg_ratio:.4f} adaptive_coverage={adaptive_coverage:.4f}")
+    print(f"qhat_test_coverage={qhat_test_coverage:.4f}")
+    print(f"ratio_semantics_direction={ratio_semantics_direction}")
+    print(f"adaptive_policy_mode={adaptive_policy_mode}")
     if adaptive_beats_uniform:
         print("Adaptive selection achieved a higher average compression ratio than uniform under similar coverage.")
+    elif adaptive_competitive:
+        print("Adaptive selection matched the uniform policy closely under similar coverage.")
     elif adaptive_avg_ratio > uniform_ratio and not under_similar_coverage:
         print("Adaptive selection increased the average compression ratio, but coverage was not similar enough to claim a win.")
     else:

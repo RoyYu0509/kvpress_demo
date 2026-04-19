@@ -1,0 +1,15 @@
+{
+  "task1_seq_len_cap": 256,
+  "task1_max_memory_saving_pct": 1.7671412703221256,
+  "task1_min_perplexity_delta": 5.773630310773173,
+  "task2_num_unique_inputs": 16,
+  "task2_num_rows": 64,
+  "task2_sequence_length_std": 10.015612812005065,
+  "task2_num_unique_lengths": 5,
+  "task3_uniform_coverage": 0.25,
+  "task3_adaptive_coverage": 0.0,
+  "task3_uniform_ratio": 0.6,
+  "task3_adaptive_avg_ratio": 0.2,
+  "task3_num_calibration": 3,
+  "task3_num_test": 4
+}

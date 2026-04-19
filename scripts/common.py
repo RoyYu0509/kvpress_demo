@@ -7,7 +7,7 @@ import os
 import random
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -28,6 +28,7 @@ except ImportError:
     disable_hf_hub_progress_bars = None
 
 from kvpress import ExpectedAttentionPress
+from kvpress.utils import extract_keys_and_values
 
 try:
     import multiprocess.resource_tracker as multiprocess_resource_tracker
@@ -41,7 +42,7 @@ DEFAULT_MODEL_CANDIDATES = (
     "Qwen/Qwen2.5-0.5B",
     "HuggingFaceTB/SmolLM2-360M",
 )
-DEFAULT_TASK1_RATIOS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+DEFAULT_TASK1_RATIOS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 DEFAULT_TASK23_RATIOS = (0.2, 0.4, 0.6, 0.8)
 DEFAULT_DATASET_NAME = "wikitext"
 DEFAULT_DATASET_CONFIG = "wikitext-2-raw-v1"
@@ -92,60 +93,12 @@ class SampleRecord:
     source_index: int
     text: str
     input_ids: torch.Tensor
+    target_length: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def sequence_length(self) -> int:
         return int(self.input_ids.shape[-1])
-
-
-class MemoryTracker:
-    def __init__(self, device: str):
-        self.device = device
-        self.values_mb: list[float] = []
-        self.metric_name = self._detect_metric_name()
-        gc.collect()
-        if self.device == "mps":
-            try:
-                torch.mps.empty_cache()
-                synchronize_device(self.device)
-            except Exception:
-                pass
-        self.baseline_mb = current_memory_mb(self.device)
-
-    def _detect_metric_name(self) -> str:
-        if self.device == "mps":
-            has_current = hasattr(torch.mps, "current_allocated_memory")
-            has_driver = hasattr(torch.mps, "driver_allocated_memory")
-            if has_current and has_driver:
-                return "mps_driver_or_current_allocated_mb_delta"
-            if has_driver:
-                return "mps_driver_allocated_mb_delta"
-            if has_current:
-                return "mps_current_allocated_mb_delta"
-        return "process_rss_mb_delta"
-
-    def sample(self) -> float:
-        mb = max(current_memory_mb(self.device) - self.baseline_mb, 0.0)
-        self.values_mb.append(mb)
-        return mb
-
-    def peak_mb(self) -> float:
-        if not self.values_mb:
-            self.sample()
-        return max(self.values_mb)
-
-
-def current_memory_mb(device: str) -> float:
-    if device == "mps":
-        values: list[float] = []
-        if hasattr(torch.mps, "current_allocated_memory"):
-            values.append(float(torch.mps.current_allocated_memory()) / (1024**2))
-        if hasattr(torch.mps, "driver_allocated_memory"):
-            values.append(float(torch.mps.driver_allocated_memory()) / (1024**2))
-        if values:
-            return max(values)
-    rss = psutil.Process(os.getpid()).memory_info().rss
-    return float(rss) / (1024**2)
 
 
 def detect_device() -> str:
@@ -193,6 +146,16 @@ def parse_ratio_list(raw: str) -> list[float]:
         if not chunk:
             continue
         values.append(float(chunk))
+    return values
+
+
+def parse_int_list(raw: str) -> list[int]:
+    values = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        values.append(int(chunk))
     return values
 
 
@@ -253,36 +216,121 @@ def load_model_bundle(
     raise RuntimeError("Unable to load any candidate model.\n" + "\n".join(errors))
 
 
-def load_wikitext_samples(
-    tokenizer: Any,
+def load_nonempty_wikitext_rows(
     split: str,
-    num_samples: int,
-    seq_len_cap: int,
     dataset_name: str = DEFAULT_DATASET_NAME,
     dataset_config: str = DEFAULT_DATASET_CONFIG,
-) -> list[SampleRecord]:
+) -> list[str]:
     dataset = load_dataset(dataset_name, dataset_config, split=split)
-    rows: list[SampleRecord] = []
-    input_id = 0
-    for source_index, row in enumerate(dataset):
+    rows = []
+    for row in dataset:
         text = row["text"].strip()
-        if not text:
-            continue
-        token_ids = tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids[:, :seq_len_cap]
-        if token_ids.numel() == 0:
-            continue
-        rows.append(
+        if text:
+            rows.append(text)
+    return rows
+
+
+def load_wikitext_token_stream(
+    tokenizer: Any,
+    split: str,
+    dataset_name: str = DEFAULT_DATASET_NAME,
+    dataset_config: str = DEFAULT_DATASET_CONFIG,
+    batch_size: int = 512,
+) -> torch.Tensor:
+    rows = load_nonempty_wikitext_rows(split, dataset_name=dataset_name, dataset_config=dataset_config)
+    separator_ids = tokenizer("\n\n", add_special_tokens=False)["input_ids"] or [tokenizer.eos_token_id]
+    flat_ids: list[int] = []
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        encoded = tokenizer(batch, add_special_tokens=False)["input_ids"]
+        for ids in encoded:
+            if ids:
+                flat_ids.extend(ids)
+                flat_ids.extend(separator_ids)
+    if not flat_ids:
+        raise RuntimeError(f"Token stream for split={split} is empty.")
+    return torch.tensor(flat_ids, dtype=torch.long).unsqueeze(0)
+
+
+def build_non_overlapping_windows(
+    token_stream: torch.Tensor,
+    window_length: int,
+    num_samples: int,
+    split_name: str,
+) -> list[SampleRecord]:
+    flat_tokens = token_stream.squeeze(0)
+    total_tokens = int(flat_tokens.shape[0])
+    starts = list(range(0, total_tokens - window_length + 1, window_length))
+    selected_starts = starts[:num_samples]
+    samples = []
+    for input_id, start in enumerate(selected_starts):
+        window = flat_tokens[start : start + window_length].clone().unsqueeze(0)
+        samples.append(
             SampleRecord(
                 input_id=input_id,
-                source_index=source_index,
-                text=text,
-                input_ids=token_ids,
+                source_index=start,
+                text=f"{split_name}_window_{start}",
+                input_ids=window,
+                target_length=window_length,
+                metadata={"start_position": start, "window_length": window_length},
             )
         )
-        input_id += 1
-        if len(rows) >= num_samples:
-            break
-    return rows
+    return samples
+
+
+def _balanced_counts(total_samples: int, num_buckets: int) -> list[int]:
+    base = total_samples // num_buckets
+    remainder = total_samples % num_buckets
+    return [base + (1 if index < remainder else 0) for index in range(num_buckets)]
+
+
+def build_balanced_variable_length_windows(
+    token_stream: torch.Tensor,
+    target_lengths: Sequence[int],
+    total_samples: int,
+    seed: int,
+    split_name: str,
+) -> list[SampleRecord]:
+    flat_tokens = token_stream.squeeze(0)
+    total_tokens = int(flat_tokens.shape[0])
+    max_length = max(target_lengths)
+    anchor_starts = list(range(0, total_tokens - max_length + 1, max_length))
+    if not anchor_starts:
+        raise RuntimeError("Token stream is too short for the requested target lengths.")
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(anchor_starts)
+    actual_samples = min(total_samples, len(anchor_starts))
+    selected_anchors = anchor_starts[:actual_samples]
+
+    counts = _balanced_counts(actual_samples, len(target_lengths))
+    assigned_lengths: list[int] = []
+    for length, count in zip(target_lengths, counts):
+        assigned_lengths.extend([length] * count)
+    rng.shuffle(assigned_lengths)
+
+    samples = []
+    for input_id, (anchor_start, target_length) in enumerate(zip(selected_anchors, assigned_lengths)):
+        max_offset = max_length - target_length
+        offset = int(rng.integers(0, max_offset + 1)) if max_offset > 0 else 0
+        start = anchor_start + offset
+        window = flat_tokens[start : start + target_length].clone().unsqueeze(0)
+        samples.append(
+            SampleRecord(
+                input_id=input_id,
+                source_index=start,
+                text=f"{split_name}_window_{start}_{target_length}",
+                input_ids=window,
+                target_length=target_length,
+                metadata={
+                    "anchor_start": anchor_start,
+                    "start_position": start,
+                    "target_length": target_length,
+                    "offset_within_anchor": offset,
+                },
+            )
+        )
+    return samples
 
 
 def split_tail_window(input_ids: torch.Tensor, eval_length: int) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -321,6 +369,18 @@ def mean_kl_divergence(reference_logits: torch.Tensor, approx_logits: torch.Tens
     return float(kl.mean().item())
 
 
+def mean_logit_entropy(logits: torch.Tensor) -> float:
+    log_probs = torch.log_softmax(logits.float(), dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1).mean()
+    return float(entropy.item())
+
+
+def mean_max_probability(logits: torch.Tensor) -> float:
+    probs = torch.softmax(logits.float(), dim=-1)
+    return float(probs.max(dim=-1).values.mean().item())
+
+
 def compute_mean_hidden_state_norm(hidden_state: torch.Tensor) -> float:
     return float(hidden_state.float().norm(dim=-1).mean().item())
 
@@ -331,6 +391,84 @@ def compute_attention_entropy(attention_tensor: torch.Tensor | None) -> float:
     probs = attention_tensor.float().clamp_min(1e-8)
     entropy = -(probs * probs.log()).sum(dim=-1).mean()
     return float(entropy.item())
+
+
+def snapshot_resource_metrics(device: str) -> dict[str, float]:
+    process = psutil.Process(os.getpid())
+    metrics = {
+        "process_rss_mb": float(process.memory_info().rss) / (1024**2),
+    }
+    if device == "mps":
+        metrics["mps_current_allocated_mb"] = (
+            float(torch.mps.current_allocated_memory()) / (1024**2)
+            if hasattr(torch.mps, "current_allocated_memory")
+            else math.nan
+        )
+        metrics["mps_driver_allocated_mb"] = (
+            float(torch.mps.driver_allocated_memory()) / (1024**2)
+            if hasattr(torch.mps, "driver_allocated_memory")
+            else math.nan
+        )
+    else:
+        metrics["mps_current_allocated_mb"] = math.nan
+        metrics["mps_driver_allocated_mb"] = math.nan
+    return metrics
+
+
+class ResourceTracker:
+    def __init__(self, device: str):
+        self.device = device
+        gc.collect()
+        if device == "mps":
+            try:
+                torch.mps.empty_cache()
+                synchronize_device(device)
+            except Exception:
+                pass
+        self.baseline = snapshot_resource_metrics(device)
+        self.peaks = dict(self.baseline)
+
+    def sample(self) -> dict[str, float]:
+        snapshot = snapshot_resource_metrics(self.device)
+        for key, value in snapshot.items():
+            if math.isnan(value):
+                continue
+            baseline_value = self.peaks.get(key, math.nan)
+            if math.isnan(baseline_value) or value > baseline_value:
+                self.peaks[key] = value
+        return snapshot
+
+    def summary(self) -> dict[str, float]:
+        summary: dict[str, float] = {}
+        for key, peak_value in self.peaks.items():
+            baseline_value = self.baseline.get(key, math.nan)
+            summary[f"peak_{key}"] = peak_value
+            summary[f"peak_{key}_delta"] = max(peak_value - baseline_value, 0.0) if not math.isnan(peak_value) else math.nan
+        return summary
+
+
+def inspect_cache(cache: Any) -> dict[str, Any]:
+    layer_token_counts: list[int] = []
+    total_bytes = 0
+    dtype_names: set[str] = set()
+    num_layers = len(cache.layers)
+    for layer_idx in range(num_layers):
+        keys, values = extract_keys_and_values(cache, layer_idx)
+        layer_token_counts.append(int(keys.shape[2]))
+        total_bytes += int(keys.numel() * keys.element_size() + values.numel() * values.element_size())
+        dtype_names.add(str(keys.dtype).replace("torch.", ""))
+
+    avg_tokens = float(np.mean(layer_token_counts)) if layer_token_counts else math.nan
+    return {
+        "num_layers": num_layers,
+        "layer_token_counts": layer_token_counts,
+        "total_kv_tokens": int(sum(layer_token_counts)),
+        "avg_kept_tokens_per_layer": avg_tokens,
+        "min_kept_tokens_per_layer": int(min(layer_token_counts)) if layer_token_counts else 0,
+        "max_kept_tokens_per_layer": int(max(layer_token_counts)) if layer_token_counts else 0,
+        "estimated_kv_cache_mb": float(total_bytes) / (1024**2),
+        "dtype_names": ",".join(sorted(dtype_names)),
+    }
 
 
 def build_expected_attention_press(compression_ratio: float, n_future_positions: int) -> ExpectedAttentionPress:
@@ -348,7 +486,8 @@ def evaluate_window(
     press: ExpectedAttentionPress | None = None,
     output_hidden_states: bool = False,
     output_attentions: bool = False,
-    memory_tracker: MemoryTracker | None = None,
+    resource_tracker: ResourceTracker | None = None,
+    collect_cache_stats: bool = True,
 ) -> dict[str, Any]:
     if prefix_ids.shape[0] != 1 or eval_ids.shape[0] != 1:
         raise ValueError("Expected batch size 1 inputs.")
@@ -364,10 +503,11 @@ def evaluate_window(
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
         )
-        if memory_tracker is not None:
-            memory_tracker.sample()
+        if resource_tracker is not None:
+            resource_tracker.sample()
         first_logits = prefix_outputs.logits[:, -1:, :]
         cache = prefix_outputs.past_key_values
+        cache_stats = inspect_cache(cache) if collect_cache_stats else {}
     continuation_logits = None
     if eval_ids.shape[1] > 1:
         with torch.no_grad():
@@ -378,8 +518,8 @@ def evaluate_window(
                 return_dict=True,
             )
             continuation_logits = continuation_outputs.logits
-            if memory_tracker is not None:
-                memory_tracker.sample()
+            if resource_tracker is not None:
+                resource_tracker.sample()
     synchronize_device(device)
     elapsed = time.perf_counter() - started_at
 
@@ -394,14 +534,21 @@ def evaluate_window(
     if output_attentions and prefix_outputs.attentions:
         final_attention = prefix_outputs.attentions[-1]
 
+    token_nll = logits_to_token_nll(logits, eval_ids)
     processed_tokens = int(prefix_ids.shape[1] + max(0, eval_ids.shape[1] - 1))
-    return {
+    result = {
         "logits": logits,
         "elapsed_sec": elapsed,
         "processed_tokens": processed_tokens,
         "mean_hidden_state_norm": compute_mean_hidden_state_norm(final_hidden_state) if final_hidden_state is not None else math.nan,
         "attention_entropy": compute_attention_entropy(final_attention),
+        "baseline_token_nll_mean": float(token_nll.mean().item()),
+        "baseline_logit_entropy_mean": mean_logit_entropy(logits),
+        "baseline_max_probability_mean": mean_max_probability(logits),
+        "cache_stats": cache_stats,
+        "resource_peaks": resource_tracker.summary() if resource_tracker is not None else {},
     }
+    return result
 
 
 def maybe_fallback_bundle_for_press(
@@ -416,7 +563,7 @@ def maybe_fallback_bundle_for_press(
 
     press = build_expected_attention_press(compression_ratio=compression_ratio, n_future_positions=n_future_positions)
     try:
-        evaluate_window(bundle.model, prefix_ids, eval_ids, device=bundle.device, press=press)
+        evaluate_window(bundle.model, prefix_ids, eval_ids, device=bundle.device, press=press, collect_cache_stats=False)
         return bundle
     except Exception as exc:
         note = (

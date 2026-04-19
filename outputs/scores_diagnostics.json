@@ -1,0 +1,18 @@
+{
+  "keep_fraction_monotonic": true,
+  "num_rows": 480,
+  "num_unique_inputs": 120,
+  "observed_sequence_lengths": [
+    256,
+    512,
+    768,
+    1024
+  ],
+  "score_semantics_monotonic": false,
+  "target_lengths": [
+    256,
+    512,
+    768,
+    1024
+  ]
+}

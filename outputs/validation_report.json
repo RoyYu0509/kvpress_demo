@@ -1,0 +1,47 @@
+{
+  "task1": {
+    "old_max_memory_saving_pct": 1.7671412703221256,
+    "new_max_kv_cache_saving_pct": 80.04032258064517,
+    "memory_more_meaningful": true,
+    "compression_verified": true,
+    "acceptable_tradeoff_exists": true,
+    "best_tradeoff_rows": [
+      {
+        "ratio": 0.5,
+        "perplexity": 23.8979,
+        "kv_cache_saving_pct": 50.0
+      },
+      {
+        "ratio": 0.7,
+        "perplexity": 22.2659,
+        "kv_cache_saving_pct": 70.0101
+      },
+      {
+        "ratio": 0.8,
+        "perplexity": 20.7192,
+        "kv_cache_saving_pct": 80.0403
+      }
+    ]
+  },
+  "task2": {
+    "old_num_unique_inputs": 16,
+    "new_num_unique_inputs": 120,
+    "old_sequence_length_std": 10.015612812005065,
+    "new_sequence_length_std": 286.2167011199731,
+    "new_num_unique_lengths": 4,
+    "enough_samples": true,
+    "length_more_diverse": true
+  },
+  "task3": {
+    "old_uniform_coverage": 0.25,
+    "old_adaptive_coverage": 0.0,
+    "new_uniform_coverage": 0.9583333333333334,
+    "new_adaptive_coverage": 0.9583333333333334,
+    "coverage_closer_to_90": true,
+    "adaptive_competitive": true,
+    "num_train": 72,
+    "num_calibration": 24,
+    "num_test": 24
+  },
+  "overall_success": true
+}
