@@ -1,0 +1,14 @@
+.DS_Store
+
+# Local Python environments
+.venv/
+venv/
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Generated demo artifacts
+*.pt

@@ -1,0 +1,10 @@
+ratio,perplexity,peak_memory_mb,memory_metric_name,memory_saving_pct,tokens_per_sec,device,model_name,num_samples,seq_len_cap
+0.0,10.679858038155002,1083.140625,mps_driver_or_current_allocated_mb_delta,0.0,1928.1888009101997,mps,Qwen/Qwen2.5-0.5B,126,256
+0.1,16.453488348928175,1112.578125,mps_driver_or_current_allocated_mb_delta,-2.717791145540316,752.3572452857055,mps,Qwen/Qwen2.5-0.5B,126,256
+0.2,20.756710413437407,1064.15625,mps_driver_or_current_allocated_mb_delta,1.752715627299084,1212.0710105021715,mps,Qwen/Qwen2.5-0.5B,126,256
+0.3,21.340149592953846,1064.25,mps_driver_or_current_allocated_mb_delta,1.744060241485268,1129.3920307668093,mps,Qwen/Qwen2.5-0.5B,126,256
+0.4,21.141872917160036,1064.203125,mps_driver_or_current_allocated_mb_delta,1.7483879343921704,997.1910163604575,mps,Qwen/Qwen2.5-0.5B,126,256
+0.5,20.158807875602154,1064.03125,mps_driver_or_current_allocated_mb_delta,1.7642561417175129,1030.7933809050576,mps,Qwen/Qwen2.5-0.5B,126,256
+0.6,19.693851838978752,1064.125,mps_driver_or_current_allocated_mb_delta,1.7556007559036968,1107.0413886047058,mps,Qwen/Qwen2.5-0.5B,126,256
+0.7,19.561290123271036,1064.0,mps_driver_or_current_allocated_mb_delta,1.7671412703221256,1123.4155210462472,mps,Qwen/Qwen2.5-0.5B,126,256
+0.8,19.948392193076952,1064.125,mps_driver_or_current_allocated_mb_delta,1.7556007559036968,1032.6185789142328,mps,Qwen/Qwen2.5-0.5B,126,256

@@ -1,0 +1,28 @@
+{
+  "adaptive_avg_ratio": 0.2,
+  "adaptive_coverage": 0.0,
+  "alpha": 0.1,
+  "best_quantile_loss": 0.014359964057803154,
+  "candidate_ratios": [
+    0.2,
+    0.4,
+    0.6,
+    0.8
+  ],
+  "coverage_gap": 0.25,
+  "ell_star": 2.0017843895571197,
+  "model_features": [
+    "ratio",
+    "sequence_length",
+    "mean_hidden_state_norm",
+    "attention_entropy_filled",
+    "attention_entropy_missing"
+  ],
+  "num_calibration": 3,
+  "num_test": 4,
+  "num_train": 9,
+  "tau": 0.8265185475349427,
+  "tau_ratio_used": 0.4,
+  "uniform_coverage": 0.25,
+  "uniform_ratio": 0.6
+}
